@@ -1,0 +1,11 @@
+[package]
+edition = "2018"
+name = "wgpu_examples"
+version = "0.1.0"
+resolver = "2"
+
+[dependencies]
+glam = "*"
+pollster = "*"
+wgpu = "*"
+winit = "*"
