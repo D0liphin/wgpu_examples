@@ -1,6 +1,8 @@
-use glam::*;
-use wgpu::util::DeviceExt;
-use winit::{
+pub use glam::*;
+use image::DynamicImage;
+pub use wgpu::util::DeviceExt;
+use wgpu::ShaderModule;
+pub use winit::{
     dpi::{PhysicalSize, Size},
     event::{Event, *},
     event_loop::{ControlFlow, EventLoop},
@@ -68,6 +70,13 @@ pub struct SurfaceHandlerConfiguration {
 }
 
 impl SurfaceHandler {
+    pub fn multisample_state(&self) -> wgpu::MultisampleState {
+        wgpu::MultisampleState {
+            count: self.sample_count() as u32,
+            ..Default::default()
+        }
+    }
+
     pub fn sample_count(&self) -> SampleCount {
         if let Some(FrameBuffer { sample_count, .. }) = self.frame_buffer {
             sample_count.into()
@@ -184,34 +193,105 @@ impl Gpu {
         }
     }
 
-    pub fn create_index_buffer(&self, contents: &[Index]) -> wgpu::Buffer {
+    fn create_buffer<T>(
+        &self,
+        label: &str,
+        contents: &[T],
+        usage: wgpu::BufferUsages,
+    ) -> wgpu::Buffer {
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Index Buffer"),
+                label: Some(label),
                 contents: Self::as_buffer_contents(contents),
-                usage: wgpu::BufferUsages::INDEX,
+                usage,
             })
+    }
+
+    pub fn create_index_buffer(&self, contents: &[Index]) -> wgpu::Buffer {
+        self.create_buffer(
+            "Index Buffer",
+            Self::as_buffer_contents(contents),
+            wgpu::BufferUsages::INDEX,
+        )
     }
 
     pub fn create_vertex_buffer<T>(&self, contents: &[T]) -> wgpu::Buffer {
-        self.device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Vertex Buffer"),
-                contents: Self::as_buffer_contents(contents),
-                usage: wgpu::BufferUsages::VERTEX,
-            })
+        self.create_buffer(
+            "Vertex Buffer",
+            Self::as_buffer_contents(contents),
+            wgpu::BufferUsages::VERTEX,
+        )
+    }
+
+    pub fn create_uniform_buffer<T>(&self, contents: &[T]) -> wgpu::Buffer {
+        self.create_buffer(
+            "Uniform Buffer",
+            Self::as_buffer_contents(contents),
+            wgpu::BufferUsages::UNIFORM,
+        )
+    }
+
+    pub fn create_texture_from_image(&self, image: DynamicImage) -> wgpu::Texture {
+        use image::GenericImageView;
+
+        let image_buffer = image.as_rgba8().expect("image format error");
+        let dimensions = image.dimensions();
+
+        let texture_extent_3d = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: None,
+            size: texture_extent_3d,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        });
+
+        self.queue.write_texture(
+            wgpu::ImageCopyTexture {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            image_buffer,
+            wgpu::ImageDataLayout {
+                offset: 0,
+                bytes_per_row: std::num::NonZeroU32::new(dimensions.0 << 2),
+                rows_per_image: std::num::NonZeroU32::new(dimensions.1),
+            },
+            texture_extent_3d,
+        );
+
+        texture
+    }
+
+    pub fn preferred_texture_format(&self) -> wgpu::TextureFormat {
+        self.surface_handler.surface_configuration.format
+    }
+
+    pub fn multisample_state(&self) -> wgpu::MultisampleState {
+        self.surface_handler.multisample_state()
     }
 }
 
-mod main_loop {
-    use super::*;
+pub struct MainLoop {
+    event_loop: EventLoop<()>,
+    window: Window,
+}
 
-    fn build_window() -> (EventLoop<()>, Window) {
+impl MainLoop {
+    pub fn new(title: &str) -> MainLoop {
         let event_loop = EventLoop::new();
-
         let mut window_builder = winit::window::WindowBuilder::new();
         window_builder.window = WindowAttributes {
-            title: "Testing".to_owned(),
+            title: title.to_owned(),
             min_inner_size: Some(Size::Physical(PhysicalSize {
                 width: 16,
                 height: 16,
@@ -224,12 +304,19 @@ mod main_loop {
         };
         let window = window_builder.build(&event_loop).unwrap();
 
-        (event_loop, window)
+        Self { event_loop, window }
     }
 
-    pub fn run(mut event_handler: impl 'static + FnMut(Event<()>, &mut ControlFlow)) -> ! {
-        let (event_loop, window) = build_window();
-        let event_loop_proxy = event_loop.create_proxy();
+    pub fn window(&self) -> &Window {
+        &self.window
+    }
+
+    pub fn run(
+        self,
+        mut event_handler: impl 'static + FnMut(&Window, Event<()>, &mut ControlFlow),
+    ) -> ! {
+        let event_loop = self.event_loop;
+        let window = self.window;
 
         event_loop.run(move |event, _, control_flow| {
             match event {
@@ -247,7 +334,51 @@ mod main_loop {
 
                 _ => {}
             }
-            event_handler(event, control_flow);
+            event_handler(&window, event, control_flow);
         })
     }
 }
+
+#[macro_export]
+macro_rules! size_of {
+    ($T:ty) => {
+        std::mem::size_of::<$T>()
+    };
+}
+
+pub struct RenderBundle {
+    vertex_buffer: wgpu::Buffer,
+    index_buffer: wgpu::Buffer,
+    uniform_buffer: wgpu::Buffer,
+    bind_group: wgpu::BindGroup,
+}
+
+#[macro_export]
+macro_rules! include_image {
+    ($file:expr $(,)?) => {
+        image::load_from_memory(include_bytes!($file)).expect("load image error")
+    };
+}
+
+pub const ALPHA_BLEND_STATE: Option<wgpu::BlendState> = Some(wgpu::BlendState {
+    color: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::SrcAlpha,
+        dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+        operation: wgpu::BlendOperation::Add,
+    },
+    alpha: wgpu::BlendComponent {
+        src_factor: wgpu::BlendFactor::One,
+        dst_factor: wgpu::BlendFactor::One,
+        operation: wgpu::BlendOperation::Add,
+    },
+});
+
+pub const CLEAR_WHITE_LOAD_OP: wgpu::Operations<wgpu::Color> = wgpu::Operations {
+    load: wgpu::LoadOp::Clear(wgpu::Color {
+        r: 0.1,
+        g: 0.2,
+        b: 0.3,
+        a: 1.0,
+    }),
+    store: true,
+};
