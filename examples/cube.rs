@@ -1,6 +1,8 @@
 use wgpu::include_wgsl;
 use wgpu_examples::*;
 
+use crate::cube::UniformBuffer;
+
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct VertexInput {
@@ -8,25 +10,27 @@ pub struct VertexInput {
     texture_coordinates: Vec2,
 }
 
-struct RenderState {
-    bind_group_layout: wgpu::BindGroupLayout,
-}
-
 mod cube {
-    use std::num::NonZeroU64;
-
-    use wgpu::UncapturedErrorHandler;
-
     use super::*;
+    use std::num::NonZeroU64;
 
     #[repr(C)]
     pub struct UniformBuffer {
-        matrix: Mat4,
+        pub matrix: Mat4,
     }
 
     impl UniformBuffer {
         pub const SIZE: NonZeroU64 =
             unsafe { NonZeroU64::new_unchecked(size_of!(UniformBuffer) as u64) };
+
+        pub const USIZE: usize = Self::SIZE.get() as usize;
+
+        pub fn as_buffer_contents(&self) -> &[u8] {
+            unsafe {
+                let bytes = std::mem::transmute::<&Self, &[u8; Self::USIZE]>(self).as_ptr();
+                std::slice::from_raw_parts(bytes, Self::USIZE)
+            }
+        }
     }
 
     macro_rules! vertex {
@@ -115,8 +119,17 @@ mod cube {
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
                         multisampled: false,
-                        sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D2,
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler {
+                        comparison: false,
+                        filtering: true,
                     },
                     count: None,
                 },
@@ -135,11 +148,21 @@ mod cube {
         })
     }
 
+    pub fn create_sampler(device: &wgpu::Device) -> wgpu::Sampler {
+        let filter_mode = wgpu::FilterMode::Nearest;
+        device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: filter_mode,
+            min_filter: filter_mode,
+            ..Default::default()
+        })
+    }
+
     pub fn create_bind_group(
         gpu: &Gpu,
         layout: &wgpu::BindGroupLayout,
         uniform: &[u8],
         texture_view: &wgpu::TextureView,
+        sampler: &wgpu::Sampler,
     ) -> wgpu::BindGroup {
         gpu.device().create_bind_group(&wgpu::BindGroupDescriptor {
             layout,
@@ -155,6 +178,10 @@ mod cube {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::Sampler(&sampler),
                 },
             ],
             label: None,
@@ -182,6 +209,8 @@ mod cube {
 }
 
 fn main() {
+    env_logger::init();
+
     let main_loop = MainLoop::new("cube");
     let mut gpu = Gpu::new(main_loop.window());
 
@@ -193,6 +222,9 @@ fn main() {
         .create_shader_module(&include_wgsl!("./cube.wgsl"));
 
     let cube_texture = gpu.create_texture_from_image(include_image!("./cube.png"));
+    let sampler = cube::create_sampler(&gpu.device());
+    let mut vertices = cube::create_vertices();
+    let indices = cube::create_indices();
 
     let render_pipeline = gpu
         .device()
@@ -217,13 +249,16 @@ fn main() {
             multisample: gpu.multisample_state(),
         });
 
-    main_loop.run(move |window, event, _| match event {
+    let mut aspect_ratio = 1.;
+
+    main_loop.run(move |delta_time, window, event, _| match event {
         Event::WindowEvent {
             ref event,
             window_id,
         } if window_id == window.id() => match event {
             WindowEvent::Resized(new_inner_size) => {
                 gpu.resize_surface(new_inner_size.width, new_inner_size.height);
+                aspect_ratio = new_inner_size.width as f32 / new_inner_size.height as f32;
             }
 
             WindowEvent::ScaleFactorChanged { new_inner_size, .. } => {
@@ -234,12 +269,56 @@ fn main() {
         },
 
         Event::RedrawRequested(_) => {
-            let mut command_encoder = gpu.device().create_command_encoder(&Default::default());
-            {
-                let mut render_pass = command_encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: None,
-                    color_attachments: 
-                })
+            if let Ok(mut render_pass_resources) = gpu.create_render_pass_resources() {
+                let rotation_matrix = Mat4::from_quat(Quat::from_euler(
+                    EulerRot::ZXY,
+                    0.,
+                    0.,
+                    90f32.to_radians() * delta_time.as_secs_f32(),
+                ));
+                dbg!(&delta_time);
+                for vertex in vertices.iter_mut() {
+                    vertex.position = rotation_matrix * vertex.position;
+                }
+
+                let uniform = UniformBuffer {
+                    matrix: cube::create_matrix(aspect_ratio),
+                };
+
+                let bind_group = cube::create_bind_group(
+                    &gpu,
+                    &bind_group_layout,
+                    uniform.as_buffer_contents(),
+                    &cube_texture.create_view(&Default::default()),
+                    &sampler,
+                );
+
+                let index_buffer = gpu.create_index_buffer(&indices);
+                let vertex_buffer = gpu.create_vertex_buffer(&vertices);
+
+                {
+                    let (view, resolve_target) =
+                        render_pass_resources.create_view_and_resolve_target();
+                    let mut render_pass = render_pass_resources.command_encoder.begin_render_pass(
+                        &wgpu::RenderPassDescriptor {
+                            label: Some("Render Pass"),
+                            color_attachments: &[wgpu::RenderPassColorAttachment {
+                                view: &view,
+                                resolve_target: resolve_target.as_ref(),
+                                ops: CLEAR_WHITE_OPERATIONS,
+                            }],
+                            depth_stencil_attachment: None,
+                        },
+                    );
+
+                    render_pass.set_pipeline(&render_pipeline);
+                    render_pass.set_bind_group(0, &bind_group, &[]);
+                    render_pass.set_index_buffer(index_buffer.slice(..), wgpu::IndexFormat::Uint16);
+                    render_pass.set_vertex_buffer(0, vertex_buffer.slice(..));
+                    render_pass.draw_indexed(0..indices.len() as _, 0, 0..1);
+                }
+                gpu.queue()
+                    .submit([render_pass_resources.command_encoder.finish()]);
             }
         }
 

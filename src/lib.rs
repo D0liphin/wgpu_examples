@@ -1,5 +1,6 @@
 pub use glam::*;
 use image::DynamicImage;
+pub use std::time;
 pub use wgpu::util::DeviceExt;
 use wgpu::ShaderModule;
 pub use winit::{
@@ -55,6 +56,10 @@ impl FrameBuffer {
             sample_count,
         }
     }
+
+    pub fn create_view(&self) -> wgpu::TextureView {
+        self.texture.create_view(&Default::default())
+    }
 }
 
 pub struct SurfaceHandler {
@@ -109,6 +114,18 @@ impl SurfaceHandler {
                 self.frame_buffer = None;
             }
             SampleCount::Msaa4x => self.frame_buffer = Some(FrameBuffer::new(&device, &config)),
+        }
+    }
+
+    pub fn create_view_and_resolve_target(
+        &self,
+        surface_texture: &wgpu::SurfaceTexture,
+    ) -> (wgpu::TextureView, Option<wgpu::TextureView>) {
+        let surface_texture_view = surface_texture.texture.create_view(&Default::default());
+        if let Some(ref frame_buffer) = self.frame_buffer {
+            (frame_buffer.create_view(), Some(surface_texture_view))
+        } else {
+            (surface_texture_view, None)
         }
     }
 }
@@ -182,6 +199,10 @@ impl Gpu {
 
     pub fn device(&self) -> &wgpu::Device {
         &self.device
+    }
+
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.queue
     }
 
     fn as_buffer_contents<T>(slice: &[T]) -> &[u8] {
@@ -279,6 +300,28 @@ impl Gpu {
     pub fn multisample_state(&self) -> wgpu::MultisampleState {
         self.surface_handler.multisample_state()
     }
+
+    pub fn create_render_pass_resources(&self) -> Result<RenderPassResources, wgpu::SurfaceError> {
+        Ok(RenderPassResources {
+            command_encoder: self.device.create_command_encoder(&Default::default()),
+            surface_texture: self.surface_handler.surface.get_current_frame()?.output,
+            gpu: &self,
+        })
+    }
+}
+
+pub struct RenderPassResources<'a> {
+    pub command_encoder: wgpu::CommandEncoder,
+    surface_texture: wgpu::SurfaceTexture,
+    gpu: &'a Gpu,
+}
+
+impl RenderPassResources<'_> {
+    pub fn create_view_and_resolve_target(&self) -> (wgpu::TextureView, Option<wgpu::TextureView>) {
+        self.gpu
+            .surface_handler
+            .create_view_and_resolve_target(&self.surface_texture)
+    }
 }
 
 pub struct MainLoop {
@@ -311,14 +354,22 @@ impl MainLoop {
         &self.window
     }
 
+    const DURATION_500MS: time::Duration = time::Duration::from_millis(500);
+
     pub fn run(
         self,
-        mut event_handler: impl 'static + FnMut(&Window, Event<()>, &mut ControlFlow),
+        mut event_handler: impl 'static + FnMut(time::Duration, &Window, Event<()>, &mut ControlFlow),
     ) -> ! {
+        let mut last_update_instant = time::Instant::now();
+        let mut last_fps_update_instant = time::Instant::now();
+        let mut update_count = 0u32;
+
         let event_loop = self.event_loop;
         let window = self.window;
 
         event_loop.run(move |event, _, control_flow| {
+            let now = time::Instant::now();
+            let duration_since_last_update = now.duration_since(last_update_instant);
             match event {
                 Event::WindowEvent {
                     ref event,
@@ -329,12 +380,28 @@ impl MainLoop {
                 },
 
                 Event::MainEventsCleared => {
+                    last_update_instant = now;
+
+                    let duration_since_last_fps_update =
+                        now.duration_since(last_fps_update_instant);
+                    if duration_since_last_fps_update > Self::DURATION_500MS {
+                        // print!(
+                        //     "\r{: >12} fps",
+                        //     update_count as f32 / duration_since_last_fps_update.as_secs_f32(),
+                        // );
+                        // use std::io::Write;
+                        // std::io::stdout().flush().unwrap_or(());
+                        last_fps_update_instant = now;
+                        update_count = 0;
+                    }
+
                     window.request_redraw();
+                    update_count += 1;
                 }
 
                 _ => {}
             }
-            event_handler(&window, event, control_flow);
+            event_handler(dbg!(duration_since_last_update), &window, event, control_flow);
         })
     }
 }
@@ -373,7 +440,7 @@ pub const ALPHA_BLEND_STATE: Option<wgpu::BlendState> = Some(wgpu::BlendState {
     },
 });
 
-pub const CLEAR_WHITE_LOAD_OP: wgpu::Operations<wgpu::Color> = wgpu::Operations {
+pub const CLEAR_WHITE_OPERATIONS: wgpu::Operations<wgpu::Color> = wgpu::Operations {
     load: wgpu::LoadOp::Clear(wgpu::Color {
         r: 0.1,
         g: 0.2,
